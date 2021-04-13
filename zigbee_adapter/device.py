@@ -19,7 +19,7 @@ def vendor():
 def availability():
     return Property(
         "availability",
-        Value("online"),
+        value="online",
         metadata={
             "@type": "EnumProperty",
             "title": "availability",

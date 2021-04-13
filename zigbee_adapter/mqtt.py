@@ -1,14 +1,21 @@
-from copy import deepcopy
-
+import time
 import ujson as json
 
-from thingtalk.toolkits import Mqtt, ee
+from copy import deepcopy
+
+from thingtalk.routers.mqtt import ThingMqtt
+from thingtalk.toolkits import mb
 from thingtalk.toolkits.mqtt import Client
 from thingtalk.schema import IntermediateMsg
+from thingtalk.models.thing import (
+    ThingPairingEvent,
+    ThingPairedEvent,
+    ThingPairFailedEvent,
+    ThingRemovedEvent
+)
 
 from pydantic import ValidationError
 
-from thingtalk import Thing
 from loguru import logger
 from .pp import (
     visit_numeric,
@@ -55,13 +62,153 @@ async def sync_property(thing_id, name, value):
         message = IntermediateMsg(
             **{"messageType": "syncProperty", "data": {name: value}}
         )
-        ee.emit(f"things/{thing_id}", message)
+        mb.emit(f"things/{thing_id}", message)
     except ValidationError as e:
         logger.error(e.json())
 
+from .device import Zigbee
 
-class Zigbee2Mqtt(Mqtt):
-    device_c = Thing
+
+async def handle_devices(app, devices):
+    for device in devices:
+        definition = device.get("definition")
+        if not definition:
+            continue
+        if app.state.things.get_thing(device.get("friendly_name")):
+            continue
+        thing = Zigbee(
+            device.get("friendly_name"),
+            definition.get("description"),
+            type_=[],
+        )
+        exposes = definition.get("exposes")
+        endpoints = []
+        switch_ids = []
+        switch_map = {}
+        for expose in exposes:
+            if expose.get("endpoint"):
+                endpoint = Zigbee(
+                    f"{device.get('friendly_name')}_{expose.get('endpoint')}",
+                    f"{definition.get('description')}_{expose.get('endpoint')}",
+                    type_=[],
+                )
+                endpoints.append(endpoint)
+                switch_ids.append(endpoint.id)
+                switch_map.update({device.get("friendly_name"): switch_ids})
+            if expose.get("type") in [
+                "light",
+                "switch",
+                "cover",
+                "fan",
+                "climate",
+            ]:
+                if len(endpoints) > 0:
+                    for endpoint in endpoints:
+                        endpoint._type.add(expose.get("type").capitalize())
+                else:
+                    thing._type.add(expose.get("type").capitalize())
+                for feature in expose.get("features"):
+                    p = get_generic_type_property(feature)
+                    if p:
+                        if len(endpoints) > 0:
+                            for endpoint in endpoints:
+                                endpoint.add_property(p)
+                        else:
+                            thing.add_property(p)
+            else:
+                if expose.get("type") == "binary":
+                    if len(endpoints) > 0:
+                        for endpoint in endpoints:
+                            endpoint._type.add("BinarySensor")
+                    else:
+                        thing._type.add("BinarySensor")
+                else:
+                    if len(endpoints) > 0:
+                        for endpoint in endpoints:
+                            endpoint._type.add("Sensor")
+                    else:
+                        thing._type.add("Sensor")
+                p = get_generic_type_property(expose)
+                if p:
+                    if len(endpoints) > 0:
+                        for endpoint in endpoints:
+                            endpoint.add_property(p)
+                    else:
+                        thing.add_property(p)
+        """ logger.debug(await thing.as_thing_description()) """
+        if len(endpoints) > 0:
+            app.state.switch_map = switch_map
+            for endpoint in endpoints:
+                await app.state.things.add_thing(endpoint)
+        else:
+            await app.state.things.add_thing(thing)
+
+
+async def handle_remove(app, data):
+    thing_id = data.get('id')
+
+    switch_map = None
+
+    if hasattr(app.state, "switch_map"):
+        switch_map = app.state.switch_map.get(thing_id)
+
+    if switch_map is not None:
+        for id_ in switch_map:
+            thing = await app.state.things.get_thing(id_)
+            if thing:
+                await app.state.things.remove_thing(id_)
+                if availability_table.get(thing.id):
+                    del availability_table[thing.id]
+                event = ThingRemovedEvent({
+                    '@type': list(thing._type),
+                    'id': thing.id,
+                    'title': thing.title
+                })
+    else:
+        thing = await app.state.things.get_thing(thing_id)
+        if thing:
+            await app.state.things.remove_thing(thing_id)
+            if availability_table.get(thing.id):
+                del availability_table[thing.id]
+            event = ThingRemovedEvent({
+                '@type': list(thing._type),
+                'id': thing.id,
+                'title': thing.title
+            })
+
+    del app.state.things.physical_devices[data.get("id")]
+    zigbee_bridge = await app.state.things.get_thing("urn:thingtalk:bridge:zigbee")
+    await zigbee_bridge.set_property("connected_devices", len(app.state.things.physical_devices))
+
+
+async def handle_pairing(app, data):
+    server = await app.state.things.get_thing('urn:thingtalk:server')
+    await server.add_event(ThingPairingEvent({
+        'id': data.get('id'),
+    }))
+
+
+async def handle_paired(app, data):
+    thing = await app.state.things.get_thing(data.get("id"))
+
+    server = await app.state.things.get_thing('urn:thingtalk:server')
+    event = ThingPairedEvent({
+        '@type': list(thing._type),
+        'id': thing.id,
+        'title': thing.title
+    })
+    await server.add_event(event)
+
+
+async def handle_pair_failed(app, data):
+    server = await app.state.things.get_thing('urn:thingtalk:server')
+    event = ThingPairFailedEvent({
+        'id': data.get('id'),
+    })
+    await server.add_event(event)
+
+
+class Zigbee2Mqtt(ThingMqtt):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -70,93 +217,22 @@ class Zigbee2Mqtt(Mqtt):
         self.ir_devices = set()
 
     def on_connect(self, client, flags, rc, properties):
+        super().on_connect(client, flags, rc, properties)
         logger.info(f"[CONNECTED {client._client_id}]")
         client_ids = client._client_id.split(":")
         if client_ids[0] == "sub_client":
             self.sub_client.subscribe("zigbee2mqtt/#", qos=1, subscription_identifier=1)
 
     async def on_message(self, client, topic: str, payload: bytes, qos, properties):
+        await super().on_message(client, topic, payload, qos, properties)
         topic_words = topic.split("/")
-        """ logger.debug(topic) """
         if topic == "zigbee2mqtt/bridge/state":
             value = payload.decode()
             await sync_property("urn:thingtalk:server", "availability", value)
         if topic == "zigbee2mqtt/bridge/devices":
             devices = json.loads(payload.decode())
-            for device in devices:
-                definition = device.get("definition")
-                if not definition:
-                    continue
-                if client.app.state.things.get_thing(device.get("friendly_name")):
-                    continue
-                thing = self.device_c(
-                    device.get("friendly_name"),
-                    definition.get("description"),
-                    type_=[],
-                )
-                exposes = definition.get("exposes")
-                endpoints = []
-                switch_ids = []
-                switch_map = {}
-                for expose in exposes:
-                    if expose.get("endpoint"):
-                        endpoint = self.device_c(
-                            f"{device.get('friendly_name')}_{expose.get('endpoint')}",
-                            f"{definition.get('description')}_{expose.get('endpoint')}",
-                            type_=[],
-                        )
-                        endpoints.append(endpoint)
-                        switch_ids.append(endpoint.id)
-                        switch_map.update({device.get("friendly_name"): switch_ids})
-                    if expose.get("type") in [
-                        "light",
-                        "switch",
-                        "cover",
-                        "fan",
-                        "climate",
-                    ]:
-                        if len(endpoints) > 0:
-                            for endpoint in endpoints:
-                                endpoint._type.add(expose.get("type").capitalize())
-                        else:
-                            thing._type.add(expose.get("type").capitalize())
-                        for feature in expose.get("features"):
-                            p = get_generic_type_property(feature)
-                            if p:
-                                if len(endpoints) > 0:
-                                    for endpoint in endpoints:
-                                        endpoint.add_property(p)
-                                else:
-                                    thing.add_property(p)
-                    else:
-                        if expose.get("type") == "binary":
-                            if len(endpoints) > 0:
-                                for endpoint in endpoints:
-                                    endpoint._type.add("BinarySensor")
-                            else:
-                                thing._type.add("BinarySensor")
-                        else:
-                            if len(endpoints) > 0:
-                                for endpoint in endpoints:
-                                    endpoint._type.add("Sensor")
-                            else:
-                                thing._type.add("Sensor")
-                        p = get_generic_type_property(expose)
-                        if p:
-                            if len(endpoints) > 0:
-                                for endpoint in endpoints:
-                                    endpoint.add_property(p)
-                            else:
-                                thing.add_property(p)
-                """ logger.debug(await thing.as_thing_description()) """
-                if len(endpoints) > 0:
-                    client.app.state.switch_map = switch_map
-                    for endpoint in endpoints:
-                        await client.app.state.things.add_thing(endpoint)
-                else:
-                    await client.app.state.things.add_thing(thing)
-            """ logger.debug(
-            f"[RECV MSG {client._client_id}] TOPIC: {topic} PAYLOAD: {payload} QOS: {qos} PROPERTIES: {properties}") """
+            await handle_devices(client.app, devices)
+
         elif topic == "zigbee2mqtt/bridge/event":
             payload = json.loads(payload.decode())
             # logger.debug(payload)
@@ -167,7 +243,7 @@ class Zigbee2Mqtt(Mqtt):
             elif payload.get("type") == "device_interview":
                 event = DeviceInterviewEvent(**payload)
                 if event.data.status == "started":
-                    ee.emit(
+                    mb.emit(
                         "zigbee/pairing",
                         {
                             "id": event.data.friendly_name,
@@ -175,7 +251,7 @@ class Zigbee2Mqtt(Mqtt):
                     )
                 elif event.data.status == "successful":
                     if event.data.supported:
-                        ee.emit(
+                        mb.emit(
                             "zigbee/paired",
                             {
                                 "id": event.data.friendly_name,
@@ -186,7 +262,7 @@ class Zigbee2Mqtt(Mqtt):
                             f"device {event.data.definition.model} is not supported"
                         )
                 elif event.data.status == "failed":
-                    ee.emit(
+                    mb.emit(
                         "zigbee/pair_failed",
                         {
                             "id": event.data.friendly_name,
@@ -196,6 +272,7 @@ class Zigbee2Mqtt(Mqtt):
                 event = DeviceLeaveEvent(**payload)
 
         elif topic == "zigbee2mqtt/bridge/logging":
+            payload = json.loads(payload.decode())
             if payload.get("type") == "zigbee_publish_error":
                 logger.error(payload)
                 if "205" in payload.get("message") or "233" in payload.get("message"):
@@ -215,8 +292,8 @@ class Zigbee2Mqtt(Mqtt):
                     user_property=("time", str(time.time())),
                 )
             if (
-                payload.get("type") == "device_removed"
-                and payload.get("message") == "left_network"
+                    payload.get("type") == "device_removed"
+                    and payload.get("message") == "left_network"
             ):
                 await handle_remove(
                     client.app,
@@ -225,8 +302,8 @@ class Zigbee2Mqtt(Mqtt):
                     },
                 )
             if (
-                payload.get("type") in ["device_force_removed", "device_removed"]
-                and payload.get("message") != "left_network"
+                    payload.get("type") in ["device_force_removed", "device_removed"]
+                    and payload.get("message") != "left_network"
             ):
                 await handle_remove(
                     client.app,
